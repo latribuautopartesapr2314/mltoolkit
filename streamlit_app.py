@@ -1,5 +1,6 @@
 import re
 import unicodedata
+import zipfile
 from datetime import datetime
 from io import BytesIO
 
@@ -208,6 +209,75 @@ def ajustar_anchos(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
 
 
+def reparar_tablas_duplicadas_excel(xlsx_bytes):
+    """
+    Repara archivos XLSX que tienen tablas internas con nombres duplicados.
+
+    Error típico:
+    ValueError: Table with name TablaPublicaciones already exists
+
+    No modifica datos visibles del Excel.
+    Solo renombra tablas internas duplicadas dentro del archivo .xlsx.
+    """
+
+    entrada = BytesIO(xlsx_bytes)
+    salida = BytesIO()
+
+    nombres_usados = set()
+
+    with zipfile.ZipFile(entrada, "r") as zin:
+        with zipfile.ZipFile(salida, "w", zipfile.ZIP_DEFLATED) as zout:
+
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                if (
+                    item.filename.startswith("xl/tables/table")
+                    and item.filename.endswith(".xml")
+                ):
+                    try:
+                        texto = data.decode("utf-8")
+                    except Exception:
+                        zout.writestr(item, data)
+                        continue
+
+                    match_display = re.search(r'displayName="([^"]+)"', texto)
+
+                    if match_display:
+                        nombre_original = match_display.group(1)
+                        nombre_final = nombre_original
+
+                        if nombre_final in nombres_usados:
+                            contador = 2
+
+                            while f"{nombre_original}_{contador}" in nombres_usados:
+                                contador += 1
+
+                            nombre_final = f"{nombre_original}_{contador}"
+
+                            texto = re.sub(
+                                r'displayName="[^"]+"',
+                                f'displayName="{nombre_final}"',
+                                texto,
+                                count=1
+                            )
+
+                            texto = re.sub(
+                                r'\bname="[^"]+"',
+                                f'name="{nombre_final}"',
+                                texto,
+                                count=1
+                            )
+
+                        nombres_usados.add(nombre_final)
+                        data = texto.encode("utf-8")
+
+                zout.writestr(item, data)
+
+    salida.seek(0)
+    return salida.getvalue()
+
+
 # ============================================================
 # HERRAMIENTA 1 — ACTUALIZAR INTEGRALY
 # ============================================================
@@ -320,6 +390,8 @@ def determinar_estado_por_stock(stock_final):
 
 
 def armar_base_global_precios(actualizacion_bytes):
+    actualizacion_bytes = reparar_tablas_duplicadas_excel(actualizacion_bytes)
+
     xls = pd.ExcelFile(BytesIO(actualizacion_bytes))
 
     filas_origen = []
@@ -467,6 +539,7 @@ def procesar_integraly(integraly_bytes, actualizacion_bytes):
         stock_invalido
     ) = armar_base_global_precios(actualizacion_bytes)
 
+    integraly_bytes = reparar_tablas_duplicadas_excel(integraly_bytes)
     wb = load_workbook(BytesIO(integraly_bytes))
 
     if NOMBRE_HOJA_CONTROL_INTEGRALY in wb.sheetnames:
@@ -741,14 +814,6 @@ def procesar_integraly(integraly_bytes, actualizacion_bytes):
                 })
 
                 continue
-
-            # ====================================================
-            # SI EL PRECIO ACTUAL DE INTEGRALY ES MENOR O IGUAL
-            # A 1.500.000, O NO SE PUDO LEER:
-            # - MODIFICA PRECIO DESDE GLOBAL + 12000
-            # - MODIFICA STOCK DESDE ASTK
-            # - MODIFICA ESTADO SEGÚN STOCK
-            # ====================================================
 
             ws.cell(row=row, column=col_precio).value = precio_final
             filas_actualizadas_precio += 1
@@ -1216,6 +1281,8 @@ def leer_config_publicador(wb_agente):
 
 
 def cargar_df_agente(agente_bytes):
+    agente_bytes = reparar_tablas_duplicadas_excel(agente_bytes)
+
     return pd.read_excel(
         BytesIO(agente_bytes),
         sheet_name=None,
@@ -1420,6 +1487,9 @@ def validar_estructura_agente(wb_agente):
 
 
 def procesar_agente_publicador(agente_bytes, publicar_bytes):
+    agente_bytes = reparar_tablas_duplicadas_excel(agente_bytes)
+    publicar_bytes = reparar_tablas_duplicadas_excel(publicar_bytes)
+
     dfs_agente = cargar_df_agente(agente_bytes)
 
     wb_agente = load_workbook(BytesIO(agente_bytes), data_only=False)
