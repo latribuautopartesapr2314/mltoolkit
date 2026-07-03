@@ -15,7 +15,7 @@ NOMBRE_HOJA_CONTROL = "CONTROL_CRUCE_INTEGRALY"
 
 SUMA_FIJA_PRECIO = 12_000
 
-UMBRAL_PRECIO_ESTADO = 1_500_000
+UMBRAL_PRECIO_INTEGRALY = 1_500_000
 ESTADO_ACTIVA = "Activa"
 ESTADO_PAUSADA = "Pausada"
 
@@ -219,22 +219,11 @@ def clasificar_cuotas(valor):
     return None
 
 
-def determinar_estado_para_menor_umbral(precio_final, stock_final):
+def determinar_estado_por_stock(stock_final):
     """
-    Esta función se usa SOLO cuando el precio es menor o igual a 1.500.000.
-    Para mayores a 1.500.000 se pausa antes y no se modifica precio ni stock.
+    Se usa solo para publicaciones cuyo precio actual en Integraly
+    NO supera $1.500.000.
     """
-
-    if precio_final is None:
-        return None, "No se pudo determinar precio final"
-
-    try:
-        precio_num = float(precio_final)
-    except Exception:
-        return None, "Precio final inválido"
-
-    if precio_num > UMBRAL_PRECIO_ESTADO:
-        return ESTADO_PAUSADA, "Precio mayor a 1.500.000"
 
     if stock_final is None:
         return None, "No se pudo determinar stock"
@@ -245,9 +234,9 @@ def determinar_estado_para_menor_umbral(precio_final, stock_final):
         return None, "Stock inválido"
 
     if stock_num >= 1:
-        return ESTADO_ACTIVA, "Precio menor o igual a 1.500.000 y stock >= 1"
+        return ESTADO_ACTIVA, "Precio actual Integraly menor o igual a 1.500.000 y stock >= 1"
 
-    return ESTADO_PAUSADA, "Precio menor o igual a 1.500.000 y stock <= 0"
+    return ESTADO_PAUSADA, "Precio actual Integraly menor o igual a 1.500.000 y stock <= 0"
 
 
 def obtener_headers_ws(ws):
@@ -448,7 +437,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
     control_estado_actualizado = []
     control_estado_no_actualizado = []
     control_mayor_umbral_pausada = []
-    control_bloqueados_por_umbral = []
+    control_bloqueados_por_umbral_integraly = []
 
     for ws in wb.worksheets:
 
@@ -478,7 +467,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                 "Stock no actualizado": 0,
                 "Estado actualizado": 0,
                 "Estado no actualizado": 0,
-                "Pausadas por superar 1.500.000": 0,
+                "Pausadas por precio Integraly mayor a 1.500.000": 0,
                 "Bloqueadas sin modificar precio/stock": 0,
             })
             continue
@@ -547,8 +536,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
         stock_no_actualizado = 0
         estado_actualizado = 0
         estado_no_actualizado = 0
-        pausadas_umbral = 0
-        bloqueadas_umbral = 0
+        pausadas_umbral_integraly = 0
+        bloqueadas_umbral_integraly = 0
 
         for row in range(2, ws.max_row + 1):
 
@@ -566,6 +555,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
             precio_anterior = ws.cell(row=row, column=col_precio).value
             stock_anterior = ws.cell(row=row, column=col_stock).value
 
+            precio_integraly_actual_num = convertir_precio_a_numero(precio_anterior)
+
             if sku_key not in datos_por_sku:
                 sku_sin_match += 1
                 control_sku_sin_match.append({
@@ -574,6 +565,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "MLA": mla,
                     "SKU": sku_original,
                     "Cuotas": cuotas_original,
+                    "Precio actual Integraly": precio_anterior,
                     "Estado anterior": estado_anterior,
                 })
                 continue
@@ -593,6 +585,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "MLA": mla,
                     "SKU": sku_original,
                     "Cuotas": cuotas_original,
+                    "Precio actual Integraly": precio_anterior,
                 })
 
                 control_estado_no_actualizado.append({
@@ -600,7 +593,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": "",
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": "",
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
                     "Motivo": "Cuotas no reconocidas, no se pudo determinar precio",
@@ -620,6 +614,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "MLA": mla,
                     "SKU": sku_original,
                     "Cuotas": cuotas_original,
+                    "Precio actual Integraly": precio_anterior,
                     "Precio requerido": COLUMNAS_PRECIO_ORIGEN[clave_precio],
                     "Hoja origen": datos.get("_HOJA_ORIGEN"),
                     "Fila origen": datos.get("_FILA_ORIGEN"),
@@ -630,29 +625,33 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": precio_final,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": precio_final,
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
-                    "Motivo": "Precio final inválido o vacío",
+                    "Motivo": "Precio final Global + 12000 inválido o vacío",
                 })
 
                 continue
 
             # ====================================================
             # REGLA CRÍTICA:
-            # SI EL PRECIO FINAL ES MAYOR A 1.500.000:
+            # SI EL PRECIO ACTUAL DE INTEGRALY ES MAYOR A 1.500.000:
             # - NO MODIFICA PRECIO
             # - NO MODIFICA STOCK
             # - SOLO MODIFICA ESTADO A PAUSADA
             # ====================================================
 
-            if float(precio_final) > UMBRAL_PRECIO_ESTADO:
+            if (
+                precio_integraly_actual_num is not None
+                and precio_integraly_actual_num > UMBRAL_PRECIO_INTEGRALY
+            ):
 
                 ws.cell(row=row, column=col_estado).value = ESTADO_PAUSADA
 
                 estado_actualizado += 1
-                pausadas_umbral += 1
-                bloqueadas_umbral += 1
+                pausadas_umbral_integraly += 1
+                bloqueadas_umbral_integraly += 1
 
                 registro_bloqueado = {
                     "Hoja destino": ws.title,
@@ -660,27 +659,29 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "MLA": mla,
                     "SKU": sku_original,
                     "Cuotas": cuotas_original,
-                    "Precio anterior Integraly": precio_anterior,
-                    "Stock anterior Integraly": stock_anterior,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio actual Integraly numérico": precio_integraly_actual_num,
+                    "Stock actual Integraly": stock_anterior,
                     "Precio calculado Global + 12000": precio_final,
                     "Stock Global AStk": stock_final,
                     "Estado anterior": estado_anterior,
                     "Estado final": ESTADO_PAUSADA,
-                    "Motivo": "Precio mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
+                    "Motivo": "Precio actual de Integraly mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
                 }
 
-                control_bloqueados_por_umbral.append(registro_bloqueado)
+                control_bloqueados_por_umbral_integraly.append(registro_bloqueado)
 
                 control_mayor_umbral_pausada.append({
                     "Hoja destino": ws.title,
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": precio_final,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": precio_final,
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
                     "Estado final": ESTADO_PAUSADA,
-                    "Motivo": "Precio mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
+                    "Motivo": "Precio actual de Integraly mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
                 })
 
                 control_estado_actualizado.append({
@@ -688,19 +689,21 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": precio_final,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": precio_final,
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
                     "Estado final": ESTADO_PAUSADA,
-                    "Motivo": "Precio mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
+                    "Motivo": "Precio actual de Integraly mayor a 1.500.000: no se modifica precio ni stock, solo se pausa",
                 })
 
                 continue
 
             # ====================================================
-            # SI EL PRECIO FINAL ES MENOR O IGUAL A 1.500.000:
-            # - MODIFICA PRECIO
-            # - MODIFICA STOCK
+            # SI EL PRECIO ACTUAL DE INTEGRALY ES MENOR O IGUAL
+            # A 1.500.000, O NO SE PUDO LEER:
+            # - MODIFICA PRECIO DESDE GLOBAL + 12000
+            # - MODIFICA STOCK DESDE ASTK
             # - MODIFICA ESTADO SEGÚN STOCK
             # ====================================================
 
@@ -722,10 +725,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila origen": datos.get("_FILA_ORIGEN"),
                 })
 
-            estado_final, motivo_estado = determinar_estado_para_menor_umbral(
-                precio_final,
-                stock_final
-            )
+            estado_final, motivo_estado = determinar_estado_por_stock(stock_final)
 
             if estado_final is not None:
                 ws.cell(row=row, column=col_estado).value = estado_final
@@ -736,7 +736,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": precio_final,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": precio_final,
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
                     "Estado final": estado_final,
@@ -750,7 +751,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
                     "Fila destino": row,
                     "MLA": mla,
                     "SKU": sku_original,
-                    "Precio final": precio_final,
+                    "Precio actual Integraly": precio_anterior,
+                    "Precio final Global + 12000": precio_final,
                     "Stock final": stock_final,
                     "Estado anterior": estado_anterior,
                     "Motivo": motivo_estado,
@@ -769,8 +771,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
             "Stock no actualizado": stock_no_actualizado,
             "Estado actualizado": estado_actualizado,
             "Estado no actualizado": estado_no_actualizado,
-            "Pausadas por superar 1.500.000": pausadas_umbral,
-            "Bloqueadas sin modificar precio/stock": bloqueadas_umbral,
+            "Pausadas por precio Integraly mayor a 1.500.000": pausadas_umbral_integraly,
+            "Bloqueadas sin modificar precio/stock": bloqueadas_umbral_integraly,
         })
 
     # ========================================================
@@ -780,8 +782,8 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
     ws_control = wb.create_sheet(NOMBRE_HOJA_CONTROL)
 
     ws_control.append(["Fecha proceso", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-    ws_control.append(["Suma fija aplicada a cada precio", SUMA_FIJA_PRECIO])
-    ws_control.append(["Umbral precio estado", UMBRAL_PRECIO_ESTADO])
+    ws_control.append(["Suma fija aplicada a cada precio Global", SUMA_FIJA_PRECIO])
+    ws_control.append(["Umbral precio actual Integraly", UMBRAL_PRECIO_INTEGRALY])
     ws_control.append(["Estado activa", ESTADO_ACTIVA])
     ws_control.append(["Estado pausada", ESTADO_PAUSADA])
     ws_control.append([])
@@ -796,11 +798,12 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
     ws_control.append(["Stock", "AStk"])
     ws_control.append([])
 
-    ws_control.append(["REGLA CRÍTICA MAYOR A 1.500.000"])
+    ws_control.append(["REGLA CRÍTICA PRECIO ACTUAL INTEGRALY"])
     ws_control.append(["Condición", "Acción"])
-    ws_control.append(["Precio calculado Global + 12000 > 1.500.000", "NO modifica precio, NO modifica stock, SOLO estado = Pausada"])
-    ws_control.append(["Precio calculado Global + 12000 <= 1.500.000 y stock >= 1", "Modifica precio, modifica stock, estado = Activa"])
-    ws_control.append(["Precio calculado Global + 12000 <= 1.500.000 y stock <= 0", "Modifica precio, modifica stock, estado = Pausada"])
+    ws_control.append(["Precio actual Integraly > 1.500.000", "NO modifica precio, NO modifica stock, SOLO estado = Pausada"])
+    ws_control.append(["Precio actual Integraly <= 1.500.000 y stock Global >= 1", "Modifica precio, modifica stock, estado = Activa"])
+    ws_control.append(["Precio actual Integraly <= 1.500.000 y stock Global <= 0", "Modifica precio, modifica stock, estado = Pausada"])
+    ws_control.append(["Precio actual Integraly vacío/no legible", "Modifica precio y stock si hay match; estado según stock"])
     ws_control.append([])
 
     ws_control.append(["RESUMEN"])
@@ -818,7 +821,7 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
         "Stock no actualizado",
         "Estado actualizado",
         "Estado no actualizado",
-        "Pausadas por superar 1.500.000",
+        "Pausadas por precio Integraly mayor a 1.500.000",
         "Bloqueadas sin modificar precio/stock",
     ]
 
@@ -829,47 +832,48 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
 
     agregar_tabla(
         ws_control,
-        "BLOQUEADAS POR SUPERAR 1.500.000 - NO SE MODIFICÓ PRECIO NI STOCK",
+        "BLOQUEADAS POR PRECIO ACTUAL INTEGRALY MAYOR A 1.500.000 - NO SE MODIFICÓ PRECIO NI STOCK",
         [
             "Hoja destino",
             "Fila destino",
             "MLA",
             "SKU",
             "Cuotas",
-            "Precio anterior Integraly",
-            "Stock anterior Integraly",
+            "Precio actual Integraly",
+            "Precio actual Integraly numérico",
+            "Stock actual Integraly",
             "Precio calculado Global + 12000",
             "Stock Global AStk",
             "Estado anterior",
             "Estado final",
             "Motivo",
         ],
-        control_bloqueados_por_umbral,
-        ["Sin bloqueadas por superar 1.500.000", "", "", "", "", "", "", "", "", "", "", ""]
+        control_bloqueados_por_umbral_integraly,
+        ["Sin bloqueadas por precio Integraly mayor a 1.500.000", "", "", "", "", "", "", "", "", "", "", "", ""]
     )
 
     agregar_tabla(
         ws_control,
         "SKU SIN MATCH",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas", "Estado anterior"],
+        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas", "Precio actual Integraly", "Estado anterior"],
         control_sku_sin_match,
-        ["Sin SKU sin match", "", "", "", "", ""]
+        ["Sin SKU sin match", "", "", "", "", "", ""]
     )
 
     agregar_tabla(
         ws_control,
         "CUOTAS NO RECONOCIDAS",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas"],
+        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas", "Precio actual Integraly"],
         control_cuotas_no_reconocidas,
-        ["Sin cuotas no reconocidas", "", "", "", ""]
+        ["Sin cuotas no reconocidas", "", "", "", "", ""]
     )
 
     agregar_tabla(
         ws_control,
         "PRECIO NO ACTUALIZADO",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas", "Precio requerido", "Hoja origen", "Fila origen"],
+        ["Hoja destino", "Fila destino", "MLA", "SKU", "Cuotas", "Precio actual Integraly", "Precio requerido", "Hoja origen", "Fila origen"],
         control_precio_no_actualizado,
-        ["Sin precios pendientes", "", "", "", "", "", "", ""]
+        ["Sin precios pendientes", "", "", "", "", "", "", "", ""]
     )
 
     agregar_tabla(
@@ -883,25 +887,57 @@ def procesar_archivos(integraly_bytes, actualizacion_bytes):
     agregar_tabla(
         ws_control,
         "ESTADO ACTUALIZADO",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Precio final", "Stock final", "Estado anterior", "Estado final", "Motivo"],
+        [
+            "Hoja destino",
+            "Fila destino",
+            "MLA",
+            "SKU",
+            "Precio actual Integraly",
+            "Precio final Global + 12000",
+            "Stock final",
+            "Estado anterior",
+            "Estado final",
+            "Motivo",
+        ],
         control_estado_actualizado,
-        ["Sin estados actualizados", "", "", "", "", "", "", "", ""]
+        ["Sin estados actualizados", "", "", "", "", "", "", "", "", ""]
     )
 
     agregar_tabla(
         ws_control,
         "ESTADO NO ACTUALIZADO",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Precio final", "Stock final", "Estado anterior", "Motivo"],
+        [
+            "Hoja destino",
+            "Fila destino",
+            "MLA",
+            "SKU",
+            "Precio actual Integraly",
+            "Precio final Global + 12000",
+            "Stock final",
+            "Estado anterior",
+            "Motivo",
+        ],
         control_estado_no_actualizado,
-        ["Sin estados pendientes", "", "", "", "", "", "", ""]
+        ["Sin estados pendientes", "", "", "", "", "", "", "", ""]
     )
 
     agregar_tabla(
         ws_control,
-        "PAUSADAS POR SUPERAR 1.500.000",
-        ["Hoja destino", "Fila destino", "MLA", "SKU", "Precio final", "Stock final", "Estado anterior", "Estado final", "Motivo"],
+        "PAUSADAS POR PRECIO ACTUAL INTEGRALY MAYOR A 1.500.000",
+        [
+            "Hoja destino",
+            "Fila destino",
+            "MLA",
+            "SKU",
+            "Precio actual Integraly",
+            "Precio final Global + 12000",
+            "Stock final",
+            "Estado anterior",
+            "Estado final",
+            "Motivo",
+        ],
         control_mayor_umbral_pausada,
-        ["Sin publicaciones mayores a 1.500.000 pausadas", "", "", "", "", "", "", "", ""]
+        ["Sin publicaciones mayores a 1.500.000 pausadas", "", "", "", "", "", "", "", "", ""]
     )
 
     ws_control.append([])
@@ -995,7 +1031,7 @@ st.warning(
 )
 
 st.error(
-    "Regla crítica: si el precio calculado supera $1.500.000, "
+    "Regla crítica: si el precio actual de Integraly supera $1.500.000, "
     "NO se modifica precio ni stock. Solo se fuerza el estado a Pausada."
 )
 
