@@ -1,3 +1,5 @@
+import json
+import os
 import re
 import unicodedata
 import zipfile
@@ -1712,6 +1714,570 @@ def mostrar_herramienta_agente_publicador():
 
 
 # ============================================================
+# HERRAMIENTA 3 — BEST PRICE
+# ============================================================
+# Compara precios finales (descuento proveedor + IVA) por artículo.
+# Los descuentos por proveedor se guardan en un JSON local y se
+# mantienen hasta que el usuario los cambie.
+#
+# NOTA sobre persistencia: en Streamlit Cloud el filesystem es
+# efímero: el JSON sobrevive entre sesiones, pero se pierde al
+# redeployar la app. Por eso Mansilla (38% + IVA 21%) queda como
+# default hardcodeado y se recarga solo si el JSON no existe.
+# ============================================================
+
+ARCHIVO_CONFIG_BEST_PRICE = "best_price_config.json"
+
+IVA_DEFAULT_BEST_PRICE = 21.0
+
+PROVEEDORES_DEFAULT_BEST_PRICE = {
+    "Mansilla": {
+        "descuento": 38.0,
+        "iva": 21.0,
+    }
+}
+
+# Contexto que habilita interpretar "caja": solo fluidos/lubricantes.
+REGEX_CONTEXTO_FLUIDO = (
+    r"ACEITE|LIQ|FLUIDO|GRASA|ATF|HELICOIDAL|HIPOIDAL|DOT|REFRIGER|"
+    r"DEXRON|DEXOS|LUBRICANTE|COOLANT|\d+W-?\d+"
+)
+
+# Palabras que descartan pack aunque haya patrón NxM
+# (tornillería M8X1.25, llantas 17X7, tracción 4x4, etc.)
+REGEX_EXCLUSION_PACK = (
+    r"PERNO|TORNILLO|TUERCA|TAPON|LLANTA|RUEDA|SENSOR|BOMBA|"
+    r"FILTRO|CARTER|TAPA|JUNTA|RETEN|SELLO|TUBO|VALVULA|"
+    r"\bM\d+\s*[xX]|\b4\s*[xX]\s*4\b"
+)
+
+
+def cargar_config_best_price():
+    config = {
+        "proveedores": {
+            nombre: dict(datos)
+            for nombre, datos in PROVEEDORES_DEFAULT_BEST_PRICE.items()
+        },
+        "unidades_override": {},
+    }
+
+    if os.path.exists(ARCHIVO_CONFIG_BEST_PRICE):
+        try:
+            with open(ARCHIVO_CONFIG_BEST_PRICE, "r", encoding="utf-8") as f:
+                guardado = json.load(f)
+
+            if isinstance(guardado.get("proveedores"), dict):
+                config["proveedores"].update(guardado["proveedores"])
+
+            if isinstance(guardado.get("unidades_override"), dict):
+                config["unidades_override"] = {
+                    str(k): int(v)
+                    for k, v in guardado["unidades_override"].items()
+                    if str(v).strip() != ""
+                }
+
+        except Exception:
+            pass
+
+    return config
+
+
+def guardar_config_best_price(config):
+    try:
+        with open(ARCHIVO_CONFIG_BEST_PRICE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def detectar_unidades_pack(descripcion):
+    """
+    Devuelve (unidades, confianza):
+    - "alta": patrón confiable (unidad de litros, palabra CAJA, formato GM n-m)
+    - "verificar": patrón parcial por descripción truncada, conviene confirmar
+    - (None, None): se interpreta como precio por unidad
+
+    Solo aplica en contexto de fluidos/lubricantes para no confundir
+    con métricas de tornillería (M10 X 25), llantas (17X7) o 4x4.
+    """
+
+    if descripcion is None:
+        return None, None
+
+    texto = str(descripcion).upper()
+
+    if not re.search(REGEX_CONTEXTO_FLUIDO, texto):
+        return None, None
+
+    if re.search(REGEX_EXCLUSION_PACK, texto):
+        return None, None
+
+    # 1. "12 X 1L", "6X4 LITROS", "12x1lt", "4 X 4L" -> confiable
+    m = re.search(r"\b(\d{1,2})\s*[xX]\s*\d+(?:[.,]\d+)?\s*(?:LITROS?|LTS?|L)\b", texto)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1)), "alta"
+
+    # 2. "CAJA 12X..." aunque falte la unidad -> confiable
+    m = re.search(r"CAJA\s*(\d{1,2})\s*[xX]", texto)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1)), "alta"
+
+    # 3. "GM 20-500", "GM 24-200", "GM 12-1", "GM 6-2"
+    #    (unidades-contenido, típico líquido de frenos / grasa)
+    m = re.search(r"GM\s*(\d{1,2})-(\d{1,4})\b", texto)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1)), "alta"
+
+    # 4. Truncado sin unidad de litros: "... - 12 X 1" -> primer número
+    m = re.search(r"\b(\d{1,2})\s*[xX]\s*\d+(?:[.,]\d+)?\s*$", texto)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1)), "verificar"
+
+    # 5. "HYD404 X24" (X + número al final)
+    m = re.search(r"\bX\s*(\d{1,2})\s*$", texto)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1)), "verificar"
+
+    # 6. Truncado tipo "DEXOS 2 - 12" / "ACEA E7 - 4 X".
+    #    Exige espacio antes del guion (evita "DOT 3 1-2") y solo
+    #    tamaños de pack habituales (evita tambores "- 205").
+    m = re.search(r"\s-\s*(\d{1,2})(?:\s*[xX])?\s*$", texto)
+    if m and int(m.group(1)) in (2, 3, 4, 6, 12, 24):
+        return int(m.group(1)), "verificar"
+
+    return None, None
+
+
+def resolver_columnas_lista_proveedor(columnas):
+    col_codigo = None
+    col_descripcion = None
+    col_precio = None
+
+    for col in columnas:
+        nombre = normalizar_texto(col)
+
+        if col_codigo is None and ("codigo" in nombre or nombre in ("sku", "item_code", "cod")):
+            col_codigo = col
+
+        if col_descripcion is None and (
+            "descripcion" in nombre or "detalle" in nombre or "articulo" in nombre
+        ):
+            col_descripcion = col
+
+        if col_precio is None and (
+            "lista" in nombre or "precio" in nombre or "price" in nombre
+        ):
+            col_precio = col
+
+    faltantes = []
+    if col_codigo is None:
+        faltantes.append("código")
+    if col_descripcion is None:
+        faltantes.append("descripción")
+    if col_precio is None:
+        faltantes.append("precio de lista")
+
+    if faltantes:
+        raise ValueError(
+            "No se detectaron estas columnas en el archivo del proveedor: "
+            + ", ".join(faltantes)
+            + ". Columnas disponibles: "
+            + ", ".join(map(str, columnas))
+        )
+
+    return col_codigo, col_descripcion, col_precio
+
+
+@st.cache_data(show_spinner=False)
+def cargar_lista_proveedor(archivo_bytes):
+    """
+    Lee el Excel del proveedor y devuelve un DataFrame:
+    CODIGO | DESCRIPCION | PRECIO_LISTA | UNID_DETECTADAS | DETECCION
+    """
+
+    archivo_bytes = reparar_tablas_duplicadas_excel(archivo_bytes)
+
+    xls = pd.ExcelFile(BytesIO(archivo_bytes))
+
+    frames = []
+
+    for hoja in xls.sheet_names:
+        df = pd.read_excel(BytesIO(archivo_bytes), sheet_name=hoja, dtype=str)
+
+        if df.empty:
+            continue
+
+        try:
+            col_cod, col_desc, col_precio = resolver_columnas_lista_proveedor(df.columns)
+        except ValueError:
+            continue
+
+        parcial = pd.DataFrame({
+            "CODIGO": df[col_cod].apply(normalizar_sku),
+            "DESCRIPCION": df[col_desc].fillna("").astype(str).str.strip(),
+            "PRECIO_LISTA": df[col_precio].apply(convertir_precio_a_numero),
+        })
+
+        parcial = parcial[(parcial["CODIGO"] != "") & parcial["PRECIO_LISTA"].notna()]
+        frames.append(parcial)
+
+    if not frames:
+        raise ValueError(
+            "Ninguna hoja del archivo tiene columnas reconocibles de "
+            "código, descripción y precio de lista."
+        )
+
+    base = pd.concat(frames, ignore_index=True)
+    base = base.drop_duplicates(subset="CODIGO", keep="first").reset_index(drop=True)
+
+    deteccion = base["DESCRIPCION"].apply(detectar_unidades_pack)
+    base["UNID_DETECTADAS"] = [d[0] for d in deteccion]
+    base["DETECCION"] = [d[1] for d in deteccion]
+
+    return base
+
+
+def calcular_precios_best_price(df, descuento_pct, iva_pct, overrides):
+    """
+    Precio final = lista * (1 - descuento) * (1 + IVA).
+    Si el artículo es caja, además se divide por las unidades.
+    El override manual (por código) pisa la detección automática.
+    """
+
+    resultado = df.copy()
+
+    unidades = []
+    origen_unidades = []
+
+    for _, fila in resultado.iterrows():
+        codigo = str(fila["CODIGO"])
+
+        if codigo in overrides:
+            unidades.append(max(1, int(overrides[codigo])))
+            origen_unidades.append("manual")
+        elif fila["UNID_DETECTADAS"] is not None and not pd.isna(fila["UNID_DETECTADAS"]):
+            unidades.append(int(fila["UNID_DETECTADAS"]))
+            origen_unidades.append(
+                "auto" if fila["DETECCION"] == "alta" else "auto (verificar)"
+            )
+        else:
+            unidades.append(1)
+            origen_unidades.append("unidad")
+
+    resultado["UNID_X_CAJA"] = unidades
+    resultado["ORIGEN_UNIDADES"] = origen_unidades
+
+    factor = (1 - descuento_pct / 100.0) * (1 + iva_pct / 100.0)
+
+    resultado["PRECIO_FINAL_CAJA"] = (resultado["PRECIO_LISTA"] * factor).round(2)
+    resultado["PRECIO_FINAL_UNIDAD"] = (
+        resultado["PRECIO_FINAL_CAJA"] / resultado["UNID_X_CAJA"]
+    ).round(2)
+
+    return resultado
+
+
+def mostrar_herramienta_best_price():
+    st.title("Best Price")
+    st.caption(
+        "Precio final con IVA por artículo, aplicando el descuento de cada proveedor. "
+        "Los aceites por caja se muestran también a precio por unidad."
+    )
+
+    config = cargar_config_best_price()
+
+    # --------------------------------------------------------
+    # Configuración de proveedores
+    # --------------------------------------------------------
+
+    with st.expander("Configuración de proveedores (descuento e IVA)"):
+
+        st.caption(
+            "Los valores quedan guardados hasta que los cambies. "
+            "Si la app se redeploya en Streamlit Cloud, vuelven los defaults "
+            "(Mansilla: 38% + IVA 21%)."
+        )
+
+        nombres = sorted(config["proveedores"].keys())
+
+        proveedor_editar = st.selectbox(
+            "Proveedor a editar",
+            nombres,
+            key="bp_proveedor_config"
+        )
+
+        datos_prov = config["proveedores"][proveedor_editar]
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            nuevo_descuento = st.number_input(
+                "Descuento sobre lista (%)",
+                min_value=0.0,
+                max_value=99.0,
+                value=float(datos_prov.get("descuento", 0.0)),
+                step=0.5,
+                key=f"bp_descuento_{proveedor_editar}"
+            )
+
+        with c2:
+            nuevo_iva = st.number_input(
+                "IVA (%)",
+                min_value=0.0,
+                max_value=50.0,
+                value=float(datos_prov.get("iva", IVA_DEFAULT_BEST_PRICE)),
+                step=0.5,
+                key=f"bp_iva_{proveedor_editar}"
+            )
+
+        if st.button("Guardar configuración", key="bp_guardar_config"):
+            config["proveedores"][proveedor_editar] = {
+                "descuento": nuevo_descuento,
+                "iva": nuevo_iva,
+            }
+
+            if guardar_config_best_price(config):
+                st.success(
+                    f"{proveedor_editar}: descuento {nuevo_descuento}% + IVA {nuevo_iva}% guardados."
+                )
+            else:
+                st.error("No se pudo escribir best_price_config.json.")
+
+        st.divider()
+        st.markdown("**Agregar proveedor nuevo**")
+
+        cn1, cn2, cn3 = st.columns([2, 1, 1])
+
+        with cn1:
+            nombre_nuevo = st.text_input("Nombre", key="bp_nuevo_nombre")
+
+        with cn2:
+            desc_nuevo = st.number_input(
+                "Descuento %",
+                min_value=0.0, max_value=99.0, value=0.0, step=0.5,
+                key="bp_nuevo_desc"
+            )
+
+        with cn3:
+            iva_nuevo = st.number_input(
+                "IVA %",
+                min_value=0.0, max_value=50.0,
+                value=IVA_DEFAULT_BEST_PRICE, step=0.5,
+                key="bp_nuevo_iva"
+            )
+
+        if st.button("Agregar proveedor", key="bp_agregar_proveedor"):
+            nombre_limpio = str(nombre_nuevo).strip()
+
+            if nombre_limpio == "":
+                st.error("El nombre del proveedor no puede estar vacío.")
+            elif nombre_limpio in config["proveedores"]:
+                st.error("Ese proveedor ya existe. Editalo arriba.")
+            else:
+                config["proveedores"][nombre_limpio] = {
+                    "descuento": desc_nuevo,
+                    "iva": iva_nuevo,
+                }
+                guardar_config_best_price(config)
+                st.success(f"Proveedor {nombre_limpio} agregado.")
+                st.rerun()
+
+    # --------------------------------------------------------
+    # Carga de lista del proveedor
+    # --------------------------------------------------------
+
+    proveedor_activo = st.selectbox(
+        "Proveedor de la lista a cargar",
+        sorted(config["proveedores"].keys()),
+        key="bp_proveedor_activo"
+    )
+
+    datos_activo = config["proveedores"][proveedor_activo]
+    descuento_activo = float(datos_activo.get("descuento", 0.0))
+    iva_activo = float(datos_activo.get("iva", IVA_DEFAULT_BEST_PRICE))
+
+    st.info(
+        f"Fórmula: precio lista − {descuento_activo}% + IVA {iva_activo}%. "
+        "Si el artículo viene por caja, además se divide por las unidades "
+        "para mostrar el precio final por unidad."
+    )
+
+    archivo_lista = st.file_uploader(
+        f"Subí la lista de precios de {proveedor_activo} (xlsx)",
+        type=["xlsx"],
+        key="bp_uploader"
+    )
+
+    if archivo_lista is None:
+        return
+
+    try:
+        with st.spinner("Leyendo lista de precios..."):
+            base = cargar_lista_proveedor(archivo_lista.getvalue())
+    except Exception as e:
+        st.error("No se pudo leer la lista del proveedor.")
+        st.exception(e)
+        return
+
+    packs_detectados = int(base["UNID_DETECTADAS"].notna().sum())
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Artículos en lista", f"{len(base):,}".replace(",", "."))
+    m2.metric("Cajas detectadas", packs_detectados)
+    m3.metric("Unidades corregidas a mano", len(config["unidades_override"]))
+
+    st.warning(
+        "Las descripciones del proveedor vienen truncadas, así que la detección "
+        "de cajas puede fallar en algunos artículos. Los marcados como "
+        "'auto (verificar)' conviene confirmarlos. Podés corregir la columna "
+        "'Unid x Caja' directamente en la tabla: el cambio queda guardado "
+        "para ese código."
+    )
+
+    # --------------------------------------------------------
+    # Búsqueda y resultados
+    # --------------------------------------------------------
+
+    busqueda = st.text_input(
+        "Buscar por código o descripción (podés poner varias palabras)",
+        key="bp_busqueda",
+        placeholder="Ej: 5W30 dexos | 106396 | liq frenos dot 4"
+    )
+
+    solo_packs = st.checkbox(
+        "Mostrar solo artículos con precio por caja",
+        key="bp_solo_packs"
+    )
+
+    df_filtrado = base
+
+    if busqueda.strip():
+        terminos = [normalizar_texto(t) for t in busqueda.split() if t.strip()]
+
+        texto_busqueda = (
+            df_filtrado["CODIGO"].astype(str) + " " + df_filtrado["DESCRIPCION"]
+        ).apply(normalizar_texto)
+
+        mascara = pd.Series(True, index=df_filtrado.index)
+
+        for termino in terminos:
+            mascara &= texto_busqueda.str.contains(re.escape(termino), na=False)
+
+        df_filtrado = df_filtrado[mascara]
+
+    resultado = calcular_precios_best_price(
+        df_filtrado,
+        descuento_activo,
+        iva_activo,
+        config["unidades_override"]
+    )
+
+    if solo_packs:
+        resultado = resultado[resultado["UNID_X_CAJA"] > 1]
+
+    if resultado.empty:
+        st.info("No hay artículos que coincidan con la búsqueda.")
+        return
+
+    LIMITE_FILAS = 300
+    total_coincidencias = len(resultado)
+
+    if total_coincidencias > LIMITE_FILAS:
+        st.caption(
+            f"{total_coincidencias:,} coincidencias. Se muestran las primeras "
+            f"{LIMITE_FILAS}. Afiná la búsqueda para ver el resto "
+            "(la descarga también respeta este límite)."
+        )
+        resultado = resultado.head(LIMITE_FILAS)
+
+    col_final_caja = f"Final c/IVA {proveedor_activo}"
+    col_final_unidad = f"Final c/IVA x unidad {proveedor_activo}"
+
+    tabla = resultado[[
+        "CODIGO",
+        "DESCRIPCION",
+        "PRECIO_LISTA",
+        "UNID_X_CAJA",
+        "ORIGEN_UNIDADES",
+        "PRECIO_FINAL_CAJA",
+        "PRECIO_FINAL_UNIDAD",
+    ]].rename(columns={
+        "CODIGO": "Código",
+        "DESCRIPCION": "Descripción",
+        "PRECIO_LISTA": "Precio lista s/IVA",
+        "UNID_X_CAJA": "Unid x Caja",
+        "ORIGEN_UNIDADES": "Detección",
+        "PRECIO_FINAL_CAJA": col_final_caja,
+        "PRECIO_FINAL_UNIDAD": col_final_unidad,
+    })
+
+    editada = st.data_editor(
+        tabla,
+        use_container_width=True,
+        hide_index=True,
+        key="bp_editor",
+        disabled=[
+            "Código",
+            "Descripción",
+            "Precio lista s/IVA",
+            "Detección",
+            col_final_caja,
+            col_final_unidad,
+        ],
+        column_config={
+            "Unid x Caja": st.column_config.NumberColumn(
+                min_value=1,
+                max_value=48,
+                step=1,
+                help="Editá acá si la caja tiene otra cantidad. Se guarda por código."
+            ),
+            "Precio lista s/IVA": st.column_config.NumberColumn(format="$ %.2f"),
+            col_final_caja: st.column_config.NumberColumn(format="$ %.2f"),
+            col_final_unidad: st.column_config.NumberColumn(format="$ %.2f"),
+        },
+    )
+
+    # Persistir ediciones manuales de unidades y recalcular
+    unidades_previas = tabla.set_index("Código")["Unid x Caja"].to_dict()
+    hubo_cambios = False
+
+    for _, fila in editada.iterrows():
+        codigo = str(fila["Código"])
+
+        try:
+            unidades_nuevas = int(fila["Unid x Caja"])
+        except Exception:
+            continue
+
+        if unidades_nuevas < 1:
+            continue
+
+        if unidades_nuevas != int(unidades_previas.get(codigo, 1)):
+            config["unidades_override"][codigo] = unidades_nuevas
+            hubo_cambios = True
+
+    if hubo_cambios:
+        guardar_config_best_price(config)
+        st.rerun()
+
+    # Descarga del resultado visible
+    salida = BytesIO()
+
+    exportable = tabla.copy()
+    exportable.to_excel(salida, index=False)
+    salida.seek(0)
+
+    st.download_button(
+        "Descargar resultado (xlsx)",
+        data=salida,
+        file_name=f"best_price_{normalizar_texto(proveedor_activo).replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="bp_descarga"
+    )
+
+
+# ============================================================
 # SIDEBAR / ROUTER PRINCIPAL
 # ============================================================
 
@@ -1722,6 +2288,7 @@ herramienta = st.sidebar.selectbox(
     [
         "Actualizar Integraly",
         "Agente Publicador",
+        "Best_price",
     ]
 )
 
@@ -1730,3 +2297,6 @@ if herramienta == "Actualizar Integraly":
 
 elif herramienta == "Agente Publicador":
     mostrar_herramienta_agente_publicador()
+
+elif herramienta == "Best_price":
+    mostrar_herramienta_best_price()
